@@ -17,8 +17,10 @@ class DDIMSampler(object):
 
     def register_buffer(self, name, attr):
         if type(attr) == torch.Tensor:
-            if attr.device != torch.device("cuda"):
+            if attr.device != torch.device("cuda") and torch.cuda.is_available():
                 attr = attr.to(torch.device("cuda"))
+            elif attr.device == torch.device("cuda") and not torch.cuda.is_available():
+                attr = attr.to(torch.device("cpu"))
         setattr(self, name, attr)
 
     def make_schedule(self, ddim_num_steps, ddim_discretize="uniform", ddim_eta=0., verbose=True):
@@ -167,6 +169,7 @@ class DDIMSampler(object):
 
         # cond_copy, unconditional_conditioning_copy = copy.deepcopy(cond), copy.deepcopy(unconditional_conditioning)
         for i, step in enumerate(iterator):
+            print("Sampling step: ", i)
             index = total_steps - i - 1
             ts = torch.full((b,), step, device=device, dtype=torch.long)
 
@@ -199,6 +202,8 @@ class DDIMSampler(object):
             if index % log_every_t == 0 or index == total_steps - 1:
                 intermediates['x_inter'].append(img)
                 intermediates['pred_x0'].append(pred_x0)
+            if i >=2: 
+                break
 
         return img, intermediates
 

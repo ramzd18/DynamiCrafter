@@ -15,6 +15,9 @@ from lvdm.models.samplers.ddim import DDIMSampler
 from lvdm.models.samplers.ddim_multiplecond import DDIMSampler as DDIMSampler_multicond
 from utils.utils import instantiate_from_config
 import random
+from contextlib import nullcontext
+import numpy as np
+import cv2
 
 
 def get_filelist(data_dir, postfixes):
@@ -133,27 +136,34 @@ def save_results(prompt, samples, filename, fakedir, fps=8, loop=False):
         torchvision.io.write_video(path, grid, fps=fps, video_codec='h264', options={'crf': '10'}) ## crf indicates the quality
 
 
-def save_results_seperate(prompt, samples, filename, fakedir, fps=10, loop=False):
-    prompt = prompt[0] if isinstance(prompt, list) else prompt
-
-    ## save video
-    videos = [samples]
-    savedirs = [fakedir]
-    for idx, video in enumerate(videos):
-        if video is None:
-            continue
-        # b,c,t,h,w
-        video = video.detach().cpu()
-        if loop: # remove the last frame
-            video = video[:,:,:-1,...]
-        video = torch.clamp(video.float(), -1., 1.)
-        n = video.shape[0]
-        for i in range(n):
-            grid = video[i,...]
-            grid = (grid + 1.0) / 2.0
-            grid = (grid * 255).to(torch.uint8).permute(1, 2, 3, 0) #thwc
-            path = os.path.join(savedirs[idx].replace('samples', 'samples_separate'), f'{filename.split(".")[0]}_sample{i}.mp4')
-            torchvision.io.write_video(path, grid, fps=fps, video_codec='h264', options={'crf': '10'})
+def save_results_seperate(prompt, samples, filename, savedir, fps=8, loop=False):
+    # Convert tensor to uint8 format and ensure correct shape
+    # samples shape should be [n_samples, c, t, h, w]
+    grid = ((samples + 1.0) * 127.5).clamp(0, 255).to(torch.uint8)
+    
+    # Take first sample and rearrange dimensions to [t, h, w, c]
+    grid = grid[0].permute(1, 2, 3, 0)
+    
+    # Move to CPU and convert to numpy
+    grid = grid.cpu().numpy()
+    
+    # Create the save path
+    os.makedirs(savedir, exist_ok=True)
+    path = os.path.join(savedir, f"{filename}.mp4")
+    
+    # Save using OpenCV
+    height, width = grid.shape[1], grid.shape[2]
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    video = cv2.VideoWriter(path, fourcc, fps, (width, height))
+    
+    for frame in grid:  # Now frames are already in [h, w, c] format
+        # Ensure we have 3 channels (RGB)
+        if frame.shape[-1] != 3:
+            frame = frame[:, :, :3]
+        video.write(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    
+    video.release()
+    print(f'Saved video to {path}')
 
 def get_latent_z(model, videos):
     b, c, t, h, w = videos.shape
@@ -163,9 +173,10 @@ def get_latent_z(model, videos):
     return z
 
 
-def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddim_steps=50, ddim_eta=1., \
+def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddim_steps=3, ddim_eta=1., \
                         unconditional_guidance_scale=1.0, cfg_img=None, fs=None, text_input=False, multiple_cond_cfg=False, loop=False, interp=False, timestep_spacing='uniform', guidance_rescale=0.0, **kwargs):
     ddim_sampler = DDIMSampler(model) if not multiple_cond_cfg else DDIMSampler_multicond(model)
+    print("Sampler loaded")
     batch_size = noise_shape[0]
     fs = torch.tensor([fs] * batch_size, dtype=torch.long, device=model.device)
 
@@ -202,6 +213,7 @@ def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddi
             uc["c_concat"] = [img_cat_cond]
     else:
         uc = None
+    print("FINISHED CONDITIONAL")
 
     ## we need one more unconditioning image=yes, text=""
     if multiple_cond_cfg and cfg_img != 1.0:
@@ -217,7 +229,7 @@ def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddi
 
     batch_variants = []
     for _ in range(n_samples):
-
+        print("STARTING SAMPLE")
         if z0 is not None:
             cond_z0 = z0.clone()
             kwargs.update({"clean_cond": True})
@@ -245,6 +257,7 @@ def image_guided_synthesis(model, prompts, videos, noise_shape, n_samples=1, ddi
         ## reconstruct from latent to pixel space
         batch_images = model.decode_first_stage(samples)
         batch_variants.append(batch_images)
+    print("FINISHED SAMPLE")
     ## variants, batch, c, t, h, w
     batch_variants = torch.stack(batch_variants)
     return batch_variants.permute(1, 0, 2, 3, 4, 5)
@@ -258,7 +271,9 @@ def run_inference(args, gpu_num, gpu_no):
     ## set use_checkpoint as False as when using deepspeed, it encounters an error "deepspeed backend not set"
     model_config['params']['unet_config']['params']['use_checkpoint'] = False
     model = instantiate_from_config(model_config)
-    model = model.cuda(gpu_no)
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
     model.perframe_ae = args.perframe_ae
     assert os.path.exists(args.ckpt_path), "Error: checkpoint Not Found!"
     model = load_model_checkpoint(model, args.ckpt_path)
@@ -293,26 +308,27 @@ def run_inference(args, gpu_num, gpu_no):
     filename_list_rank = [filename_list[i] for i in indices]
 
     start = time.time()
-    with torch.no_grad(), torch.cuda.amp.autocast():
-        for idx, indice in tqdm(enumerate(range(0, len(prompt_list_rank), args.bs)), desc='Sample Batch'):
-            prompts = prompt_list_rank[indice:indice+args.bs]
-            videos = data_list_rank[indice:indice+args.bs]
-            filenames = filename_list_rank[indice:indice+args.bs]
-            if isinstance(videos, list):
-                videos = torch.stack(videos, dim=0).to("cuda")
+    with torch.no_grad():
+        context_manager = torch.cuda.amp.autocast() if torch.cuda.is_available() else nullcontext()
+        with context_manager:
+            # Single prompt and video
+            prompt = prompt_list_rank[0]
+            video = data_list_rank[0]
+            filename = filename_list_rank[0]
+            
+            if isinstance(video, list):
+                video = torch.stack([video], dim=0).to(device)
             else:
-                videos = videos.unsqueeze(0).to("cuda")
+                video = video.unsqueeze(0).to(device)
 
-            batch_samples = image_guided_synthesis(model, prompts, videos, noise_shape, args.n_samples, args.ddim_steps, args.ddim_eta, \
+            print("Running Synthesis/Inference ...")
+
+            batch_samples = image_guided_synthesis(model, [prompt], video, noise_shape, args.n_samples, args.ddim_steps, args.ddim_eta, \
                                 args.unconditional_guidance_scale, args.cfg_img, args.frame_stride, args.text_input, args.multiple_cond_cfg, args.loop, args.interp, args.timestep_spacing, args.guidance_rescale)
 
-            ## save each example individually
-            for nn, samples in enumerate(batch_samples):
-                ## samples : [n_samples,c,t,h,w]
-                prompt = prompts[nn]
-                filename = filenames[nn]
-                # save_results(prompt, samples, filename, fakedir, fps=8, loop=args.loop)
-                save_results_seperate(prompt, samples, filename, fakedir, fps=8, loop=args.loop)
+            # Save single video
+            samples = batch_samples[0]
+            save_results_seperate(prompt, samples, filename, fakedir, fps=8, loop=args.loop)
 
     print(f"Saved in {args.savedir}. Time used: {(time.time() - start):.2f} seconds")
 
